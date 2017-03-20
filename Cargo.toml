@@ -1,0 +1,11 @@
+[package]
+name = "essimport"
+version = "0.1.0"
+authors = ["Orest Dubay <orest3.dubay@gmail.com>"]
+
+[dependencies]
+bson = "0.4.4"
+mongodb = "0.2.3"
+xml-rs = "0.4"
+clap = "2.21.1"
+zip = "0.2"
