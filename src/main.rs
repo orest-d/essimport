@@ -1,12 +1,19 @@
 extern crate clap;
 extern crate zip;
 extern crate xml;
+extern crate rustc_serialize;
+extern crate bson;
+extern crate mongodb;
 
+use std::collections::BTreeMap;
 use clap::{Arg, App};
 use std::io::{BufReader, Read};
 use std::fs::File;
 use std::str;
 use xml::reader::{EventReader, XmlEvent};
+use rustc_serialize::json::{self, ToJson, Json, Object, Array};
+use bson::{Bson, Document};
+
 
 fn is_struct(name: &str) -> bool {
     match name {
@@ -61,6 +68,21 @@ fn is_struct(name: &str) -> bool {
         _ => false
     }
 }
+
+fn is_array(name: &str) -> bool {
+    match name {
+        "DispensationTypeSamling" => true,
+        "EjerBrugerSamling" => true,
+        "KoeretoejAnvendelseSamling" => true,
+        "KoeretoejBlokeringAarsagListe" => true,
+        "KoeretoejSupplerendeKarrosseriSamling" => true,
+        "KoeretoejUdstyrSamling" => true,
+        "TilladelseSamling" => true,
+        _ => false
+    }
+}
+//TODO: KoeretoejOplysningGrundStruktur is a special case containing 0,1 or 2 KoeretoejFastKombination
+
 /*
 fn do_read(r:&mut Read){
     let mut buff = [0u8;20];
@@ -78,41 +100,90 @@ struct Record {
 
 impl Record {
     fn new(element: &str) -> Record {
-        Record{
-        element: String::from(element),
-        is_struct: is_struct(element),
-        text: String::new(),
-        structure: Vec::new()
+        Record {
+            element: String::from(element),
+            is_struct: is_struct(element),
+            text: String::new(),
+            structure: Vec::new()
         }
     }
-    fn add_text(&mut self, text:&str){
+    fn add_text(&mut self, text: &str) {
         self.text.push_str(text);
     }
-    fn add_child(&mut self, rec:Record){
+    fn add_child(&mut self, rec: Record) {
         self.structure.push(rec);
+    }
+    fn to_bson(&self) -> Bson {
+        if self.is_struct {
+            if is_array(&self.element) {
+                let mut array: bson::Array = Vec::new();
+                for r in &self.structure {
+                    array.push(r.to_bson());
+                }
+                Bson::Array(array)
+            } else {
+                let mut obj: Document = Document::new();
+                for r in &self.structure {
+                    if obj.contains_key(&r.element) {
+                        println!("ERROR: Multiple {} inside {}", r.element, self.element);
+                    } else {
+                        obj.insert_bson(r.element.clone(), r.to_bson());
+                    }
+                }
+                Bson::Document(obj)
+            }
+        } else {
+            Bson::String(self.text.clone())
+        }
+    }
+}
+
+impl ToJson for Record {
+    fn to_json(&self) -> Json {
+        if self.is_struct {
+            if is_array(&self.element) {
+                let mut array: Array = Vec::new();
+                for r in &self.structure {
+                    array.push(r.to_json());
+                }
+                Json::Array(array)
+            } else {
+                let mut obj: Object = BTreeMap::new();
+                for r in &self.structure {
+                    if obj.contains_key(&r.element) {
+                        println!("ERROR: Multiple {} inside {}", r.element, self.element);
+                    } else {
+                        obj.insert(r.element.clone(), r.to_json());
+                    }
+                }
+                Json::Object(obj)
+            }
+        } else {
+            Json::String(self.text.clone())
+        }
     }
 }
 
 fn do_read(r: &mut Read) {
     let file = BufReader::new(r);
     let parser = EventReader::new(file);
-    let mut stack:Vec<Record> = Vec::new();
+    let mut stack: Vec<Record> = Vec::new();
     for e in parser {
         match e {
             Ok(XmlEvent::StartElement { name, .. }) => {
                 println!("Start {}", name.local_name);
-                if !stack.is_empty() || name.local_name == "Statistik"{
+                if !stack.is_empty() || name.local_name == "Statistik" {
                     stack.push(Record::new(&name.local_name));
                 }
             }
             Ok(XmlEvent::EndElement { name }) => {
                 println!("End   {}", name);
-                if let Some(mut rec) = stack.pop(){
-                    if stack.is_empty(){
-                        println!("--> {:?}",rec);
-                    }
-                    else{
-                        if let Some(mut parent) = stack.pop(){
+                if let Some(mut rec) = stack.pop() {
+                    if stack.is_empty() {
+                        println!("--> {:?}", rec);
+                        println!("JSON: {}", rec.to_json());
+                    } else {
+                        if let Some(mut parent) = stack.pop() {
                             parent.add_child(rec);
                             stack.push(parent);
                         }
@@ -122,7 +193,7 @@ fn do_read(r: &mut Read) {
             Ok(XmlEvent::Characters(text)) => {
                 println!("Text  {}", text);
 
-                if let Some(mut rec) = stack.pop(){
+                if let Some(mut rec) = stack.pop() {
                     rec.add_text(&text);
                     stack.push(rec);
                 }
