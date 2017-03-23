@@ -13,6 +13,8 @@ use std::str;
 use xml::reader::{EventReader, XmlEvent};
 use rustc_serialize::json::{self, ToJson, Json, Object, Array};
 use bson::{Bson, Document};
+use mongodb::{Client, ThreadedClient};
+use mongodb::db::ThreadedDatabase;
 
 
 fn is_struct(name: &str) -> bool {
@@ -164,31 +166,48 @@ impl ToJson for Record {
     }
 }
 
-fn do_read(r: &mut Read, json_output: Option<&str>) {
+fn do_read(r: &mut Read, json_output: Option<&str>, mongodb_uri:Option<&str>, db:&str, collection:&str) {
     let mut number = 0;
     let file = BufReader::new(r);
     let parser = EventReader::new(file);
     let mut stack: Vec<Record> = Vec::new();
+    let client = mongodb_uri.map(|uri|Client::with_uri(uri).expect("Failed to initialize client."));
+    let coll = client.map(|c|c.db(db).collection(collection));
+    if coll.is_some(){
+        println!("Export to {}, database: {}, collection: {}",mongodb_uri.unwrap(),db,collection)
+    }
+
     for e in parser {
         match e {
             Ok(XmlEvent::StartElement { name, .. }) => {
-                println!("Start {}", name.local_name);
+//                println!("Start {}", name.local_name);
                 if !stack.is_empty() || name.local_name == "Statistik" {
                     stack.push(Record::new(&name.local_name));
                 }
             }
             Ok(XmlEvent::EndElement { name }) => {
-                println!("End   {}", name);
+//                println!("End   {}", name);
                 if let Some(mut rec) = stack.pop() {
                     if stack.is_empty() {
                         number += 1;
-                        println!("--> {:?}", rec);
-                        println!("JSON: {}", rec.to_json());
+                        if number%100 == 0{
+                            println!("{}",number);
+                        }
+//                        println!("--> {:?}", rec);
+//                        println!("JSON: {}", rec.to_json());
                         if let Some(path) = json_output {
                             File::create(format!("{}/{}.json", path, number))
                                 .and_then(
                                     |mut f| f.write_all(format!("{}", rec.to_json()).as_bytes())
                                 ).expect("Error writing document")
+                        }
+                        if let Some(ref c) = coll{
+                            if let bson::Bson::Document(document) = rec.to_bson(){
+//                                println!("insert {}",document);
+                                c.insert_one(document,None).expect("Insert error");
+                            }else{
+                                println!("Not a document");
+                            }
                         }
                     } else {
                         if let Some(mut parent) = stack.pop() {
@@ -199,7 +218,7 @@ fn do_read(r: &mut Read, json_output: Option<&str>) {
                 }
             }
             Ok(XmlEvent::Characters(text)) => {
-                println!("Text  {}", text);
+                //println!("Text  {}", text);
 
                 if let Some(mut rec) = stack.pop() {
                     rec.add_text(&text);
@@ -248,13 +267,13 @@ fn main() {
             .short("d")
             .long("db")
             .value_name("DATABASE")
-            .help("MongoDB database")
+            .help("MongoDB database, db test default")
             .takes_value(true))
         .arg(Arg::with_name("collection")
             .short("c")
             .long("collection")
             .value_name("COLLECTION")
-            .help("MongoDB collection")
+            .help("MongoDB collection, ess by default")
             .takes_value(true))
         .get_matches();
 
@@ -267,7 +286,10 @@ fn main() {
             println!("READ XML {}", input);
             do_read(
                 &mut File::open(input).unwrap_or_else(|err| panic!("{}\nCan't open file {}", err, input)),
-                matches.value_of("json")
+                matches.value_of("json"),
+                matches.value_of("mongodb"),
+                matches.value_of("db").unwrap_or("test"),
+                matches.value_of("collection").unwrap_or("ess")
             )
         },
 
@@ -277,7 +299,10 @@ fn main() {
             let mut archive = Box::new(zip::ZipArchive::new(f).unwrap_or_else(|err| panic!("{}\nCan't open zip archive {}", err, input)));
             do_read(
                 &mut archive.by_index(0).unwrap_or_else(|err| panic!("{}\nCan't open zipped file {}", err, input)),
-                matches.value_of("json")
+                matches.value_of("json"),
+                matches.value_of("mongodb"),
+                matches.value_of("db").unwrap_or("test"),
+                matches.value_of("collection").unwrap_or("ess")
             )
         }
         _ => panic!("Unsupported format: {}", format)
