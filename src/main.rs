@@ -11,7 +11,7 @@ use std::io::{BufReader, Read, Write};
 use std::fs::File;
 use std::str;
 use xml::reader::{EventReader, XmlEvent};
-use rustc_serialize::json::{self, ToJson, Json, Object, Array};
+use rustc_serialize::json::{ToJson, Json, Object, Array};
 use bson::{Bson, Document};
 use mongodb::{Client, ThreadedClient};
 use mongodb::db::ThreadedDatabase;
@@ -166,16 +166,19 @@ impl ToJson for Record {
     }
 }
 
-fn do_read(r: &mut Read, json_output: Option<&str>, mongodb_uri:Option<&str>, db:&str, collection:&str) {
+fn do_read(r: &mut Read, json_output: Option<&str>, json_chunk: Option<&str>, mongodb_uri:Option<&str>, db:&str, collection:&str) {
     let mut number = 0;
     let file = BufReader::new(r);
     let parser = EventReader::new(file);
     let mut stack: Vec<Record> = Vec::new();
     let client = mongodb_uri.map(|uri|Client::with_uri(uri).expect("Failed to initialize client."));
     let coll = client.map(|c|c.db(db).collection(collection));
+    let jsonchunk:usize = json_chunk.map(|x|x.parse::<usize>().expect("Unsigned number expected as jsonchunk parameter")).unwrap_or(1);
     if coll.is_some(){
         println!("Export to {}, database: {}, collection: {}",mongodb_uri.unwrap(),db,collection)
     }
+
+    let mut output_file = None;
 
     for e in parser {
         match e {
@@ -187,23 +190,25 @@ fn do_read(r: &mut Read, json_output: Option<&str>, mongodb_uri:Option<&str>, db
             }
             Ok(XmlEvent::EndElement { name }) => {
 //                println!("End   {}", name);
-                if let Some(mut rec) = stack.pop() {
+                if let Some(rec) = stack.pop() {
                     if stack.is_empty() {
+                        if (number%jsonchunk==0) && (json_output.is_some()){
+                            let path = &format!("{}/{}.json", json_output.unwrap(), number);
+                            output_file = Some(File::create(path).expect(&format!("Can't create output file {}",path)));
+                        }
                         number += 1;
                         if number%100 == 0{
                             println!("{}",number);
                         }
 //                        println!("--> {:?}", rec);
 //                        println!("JSON: {}", rec.to_json());
-                        if let Some(path) = json_output {
-                            File::create(format!("{}/{}.json", path, number))
-                                .and_then(
-                                    |mut f| f.write_all(format!("{}", rec.to_json()).as_bytes())
-                                ).expect("Error writing document")
+                        if let Some(ref mut f) = output_file{
+                            f.write_all(format!("{}", rec.to_json()).as_bytes()).expect("Error writing document");
+                            f.write("\n".as_bytes()).expect("Error writing newline");
                         }
                         if let Some(ref c) = coll{
                             if let bson::Bson::Document(document) = rec.to_bson(){
-//                                println!("insert {}",document);
+//mc                                println!("insert {}",document);
                                 c.insert_one(document,None).expect("Insert error");
                             }else{
                                 println!("Not a document");
@@ -232,6 +237,7 @@ fn do_read(r: &mut Read, json_output: Option<&str>, mongodb_uri:Option<&str>, db
             _ => {}
         }
     }
+
 }
 
 fn main() {
@@ -256,6 +262,12 @@ fn main() {
             .long("json")
             .value_name("PATH")
             .help("Export to json files")
+            .takes_value(true))
+        .arg(Arg::with_name("jsonchunk")
+            .short("n")
+            .long("jsonchunk")
+            .value_name("SIZE")
+            .help("Number of records in an import chunk")
             .takes_value(true))
         .arg(Arg::with_name("mongodb")
             .short("m")
@@ -287,6 +299,7 @@ fn main() {
             do_read(
                 &mut File::open(input).unwrap_or_else(|err| panic!("{}\nCan't open file {}", err, input)),
                 matches.value_of("json"),
+                matches.value_of("jsonchunk"),
                 matches.value_of("mongodb"),
                 matches.value_of("db").unwrap_or("test"),
                 matches.value_of("collection").unwrap_or("ess")
@@ -300,6 +313,7 @@ fn main() {
             do_read(
                 &mut archive.by_index(0).unwrap_or_else(|err| panic!("{}\nCan't open zipped file {}", err, input)),
                 matches.value_of("json"),
+                matches.value_of("jsonchunk"),
                 matches.value_of("mongodb"),
                 matches.value_of("db").unwrap_or("test"),
                 matches.value_of("collection").unwrap_or("ess")
