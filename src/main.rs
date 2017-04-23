@@ -197,7 +197,7 @@ fn do_read(r: &mut Read, json_output: Option<&str>, json_chunk: Option<&str>, mo
                             output_file = Some(File::create(path).expect(&format!("Can't create output file {}",path)));
                         }
                         number += 1;
-                        if number%100 == 0{
+                        if number%1000 == 0{
                             println!("{}",number);
                         }
 //                        println!("--> {:?}", rec);
@@ -232,7 +232,7 @@ fn do_read(r: &mut Read, json_output: Option<&str>, json_chunk: Option<&str>, mo
             }
             Err(e) => {
                 println!("Error: {}", e);
-                break;
+                //break;
             }
             _ => {}
         }
