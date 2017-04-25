@@ -10,3 +10,7 @@ xml-rs = "0.4"
 clap = "2.21.1"
 zip = "0.2"
 rustc-serialize = "0.3"
+rusqlite = "0.11.0"
+
+[features]
+bundled = []
