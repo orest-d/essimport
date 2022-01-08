@@ -3,19 +3,14 @@ extern crate clap;
 extern crate zip;
 extern crate xml;
 extern crate rustc_serialize;
-extern crate bson;
-extern crate mongodb;
 
 use std::collections::BTreeMap;
-use clap::{Arg, App};
+use clap::Parser;
 use std::io::{BufReader, Read, Write};
 use std::fs::File;
 use std::str;
 use xml::reader::{EventReader, XmlEvent};
 use rustc_serialize::json::{ToJson, Json, Object, Array};
-use bson::{Bson, Document};
-use mongodb::{Client, ThreadedClient};
-use mongodb::db::ThreadedDatabase;
 use rusqlite::Connection;
 
 enum ColType{
@@ -45,27 +40,6 @@ static COLUMNS:[(&str, ColType);18] = [
 ("RegistreringNummerRettighedGyldigTil",ColType::String),
 ("KoeretoejAnvendelseSamlingStruktur",ColType::Json)
 ];
-
-fn create_table_mysql() -> String{
-    let mut sql = String::new();
-    sql += "CREATE TABLE IF NOT EXISTS stat(\n";
-
-
-    for (i,x) in COLUMNS.iter().enumerate(){
-        let (name, ref ctype)=*x;
-
-        sql+=&match *ctype{
-            ColType::String => format!("  {:36} VARCHAR(255) CHARACTER SET utf8 COLLATE utf8_unicode_ci",name),
-            ColType::Json => format!("  {:36} JSON",name),
-            ColType::Int => format!("  {:36} INT",name)
-        };
-        if i< COLUMNS.len()-1{
-            sql+=",\n";
-        }
-    }
-    sql+=");\n";
-    sql
-}
 
 fn create_table_sqlite() -> String{
     let mut sql = String::new();
@@ -224,29 +198,6 @@ impl Record {
     fn add_child(&mut self, rec: Record) {
         self.structure.push(rec);
     }
-    fn to_bson(&self) -> Bson {
-        if self.is_struct {
-            if is_array(&self.element) {
-                let mut array: bson::Array = Vec::new();
-                for r in &self.structure {
-                    array.push(r.to_bson());
-                }
-                Bson::Array(array)
-            } else {
-                let mut obj: Document = Document::new();
-                for r in &self.structure {
-                    if obj.contains_key(&r.element) {
-                        println!("ERROR: Multiple {} inside {}", r.element, self.element);
-                    } else {
-                        obj.insert_bson(r.element.clone(), r.to_bson());
-                    }
-                }
-                Bson::Document(obj)
-            }
-        } else {
-            Bson::String(self.text.clone())
-        }
-    }
 }
 
 impl ToJson for Record {
@@ -275,22 +226,16 @@ impl ToJson for Record {
     }
 }
 
-fn do_read(r: &mut Read, json_output: Option<&str>, sqlite_output: Option<&str>, json_chunk: Option<&str>, mongodb_uri:Option<&str>, db:&str, collection:&str) {
+fn do_read(r: &mut dyn Read, json_output: Option<String>, sqlite_output: Option<String>, chunksize: usize) {
     let mut number = 0;
     let file = BufReader::new(r);
     let parser = EventReader::new(file);
     let mut stack: Vec<Record> = Vec::new();
-    let client = mongodb_uri.map(|uri|Client::with_uri(uri).expect("Failed to initialize client."));
-    let coll = client.map(|c|c.db(db).collection(collection));
-    let chunksize:usize = json_chunk.map(|x|x.parse::<usize>().expect("Unsigned number expected as chunksize parameter")).unwrap_or(1);
-    if coll.is_some(){
-        println!("Export to {}, database: {}, collection: {}",mongodb_uri.unwrap(),db,collection)
-    }
 
     let mut json_output_file = None;
-    let mut sqlite = sqlite_output.map(|path| Connection::open(path).expect(&format!("Can't open sqlite file {}",path)));
+    let sqlite = sqlite_output.map(|path| Connection::open(&path).expect(&format!("Can't open sqlite file {}",&path)));
     if let Some(ref connection) = sqlite{
-        connection.execute(&create_table_sqlite(),&[]).expect("Can't create sqlite table");
+        connection.execute(&create_table_sqlite(),[]).expect("Can't create sqlite table");
     }
 
     for e in parser {
@@ -305,9 +250,10 @@ fn do_read(r: &mut Read, json_output: Option<&str>, sqlite_output: Option<&str>,
 //                println!("End   {}", name);
                 if let Some(rec) = stack.pop() {
                     if stack.is_empty() {
-                        if (number%chunksize==0) && (json_output.is_some()){
-                            let path = &format!("{}/{}.json", json_output.unwrap(), number);
-                            json_output_file = Some(File::create(path).expect(&format!("Can't create json output file {}",path)));
+                        if let Some(path) = &json_output.as_ref().map(|x| format!("{}/{}.json", x, number)){
+                            if number%chunksize==0{
+                                json_output_file = Some(File::create(path).expect(&format!("Can't create json output file {}",path)));
+                            }
                         }
                         number += 1;
                         if number%1000 == 0{
@@ -318,21 +264,13 @@ fn do_read(r: &mut Read, json_output: Option<&str>, sqlite_output: Option<&str>,
                         if let Json::Object(obj) = rec.to_json(){
                             println!("*** {}",insert_sqlite(&obj));
                             if let Some(ref connection) = sqlite{
-                                connection.execute(&insert_sqlite(&obj),&[]).expect("Can't create insert into sqlite table");
+                                connection.execute(&insert_sqlite(&obj),[]).expect("Can't create insert into sqlite table");
                                 //connection.execute("COMMIT",&[]).expect("Can't commit sqlite insert");
                             }
                         }
                         if let Some(ref mut f) = json_output_file{
                             f.write_all(format!("{}", rec.to_json()).as_bytes()).expect("Error writing json document");
                             f.write("\n".as_bytes()).expect("Error writing newline");
-                        }
-                        if let Some(ref c) = coll{
-                            if let bson::Bson::Document(document) = rec.to_bson(){
-//mc                                println!("insert {}",document);
-                                c.insert_one(document,None).expect("Insert error");
-                            }else{
-                                println!("Not a document");
-                            }
                         }
                     } else {
                         if let Some(mut parent) = stack.pop() {
@@ -360,63 +298,37 @@ fn do_read(r: &mut Read, json_output: Option<&str>, sqlite_output: Option<&str>,
 
 }
 
-fn main() {
-    let matches = App::new("ESStatistik import")
-        .version("1.0")
-        .author("Orest Dubay <orest3.dubay@gmail.com>")
-        .about("Import data from ESStatistikListeModtag")
-        .arg(Arg::with_name("input")
-            .short("i")
-            .long("input")
-            .value_name("FILE")
-            .help("Inport from FILE")
-            .takes_value(true))
-        .arg(Arg::with_name("format")
-            .short("f")
-            .long("format")
-            .value_name("FMT")
-            .help("Input format")
-            .takes_value(true))
-        .arg(Arg::with_name("json")
-            .short("j")
-            .long("json")
-            .value_name("PATH")
-            .help("Export to json files")
-            .takes_value(true))
-        .arg(Arg::with_name("sqlite")
-            .short("l")
-            .long("sqlite")
-            .value_name("PATH")
-            .help("Export to sqlite")
-            .takes_value(true))
-        .arg(Arg::with_name("chunksize")
-            .short("n")
-            .long("chunksize")
-            .value_name("SIZE")
-            .help("Number of records in an import chunk")
-            .takes_value(true))
-        .arg(Arg::with_name("mongodb")
-            .short("m")
-            .long("mongodb")
-            .value_name("URI")
-            .help("Export to MongoDB, specify URI, e.g. mongodb://localhost:27017")
-            .takes_value(true))
-        .arg(Arg::with_name("db")
-            .short("d")
-            .long("db")
-            .value_name("DATABASE")
-            .help("MongoDB database, db test default")
-            .takes_value(true))
-        .arg(Arg::with_name("collection")
-            .short("c")
-            .long("collection")
-            .value_name("COLLECTION")
-            .help("MongoDB collection, ess by default")
-            .takes_value(true))
-        .get_matches();
+/// Import data from ESStatistikListeModtag
+#[derive(Parser, Debug)]
+#[clap(about, version, author)]
+struct Args {
+    /// File to import from
+    #[clap(short, long, default_value_t = String::from("ESStatistikListeModtag.xml"))]
+    input: String,
 
-    let input = matches.value_of("input").unwrap_or("ESStatistikListeModtag.xml");
-    let format = matches.value_of("format").unwrap_or("xml");
+    /// Input format
+    #[clap(short, long, default_value_t = String::from("xml"))]
+    format: String,
+
+    /// Export to json files
+    #[clap(short, long)]
+    json: Option<String>,
+
+    /// Export to SQLite
+    #[clap(short, long)]
+    sqlite: Option<String>,
+    
+    /// Number of records in an import chunk
+    #[clap(short, long, default_value_t = 1)]
+    chunksize: usize,
+}
+
+fn main() {
+
+    let args:Args = Args::parse();
+    
+    let input:&str = &args.input;
+    let format:&str = &args.format;
     println!("file:   {}", input);
     println!("format: {}", format);
     //    println!("{}",create_table_sqlite());
@@ -426,12 +338,9 @@ fn main() {
             println!("READ XML {}", input);
             do_read(
                 &mut File::open(input).unwrap_or_else(|err| panic!("{}\nCan't open file {}", err, input)),
-                matches.value_of("json"),
-                matches.value_of("sqlite"),
-                matches.value_of("chunksize"),
-                matches.value_of("mongodb"),
-                matches.value_of("db").unwrap_or("test"),
-                matches.value_of("collection").unwrap_or("ess")
+                args.json,
+                args.sqlite,
+                args.chunksize
             )
         },
 
@@ -439,14 +348,12 @@ fn main() {
             println!("READ ZIP {}", input);
             let f = File::open(input).unwrap_or_else(|err| panic!("{}\nCan't open file {}", err, input));
             let mut archive = Box::new(zip::ZipArchive::new(f).unwrap_or_else(|err| panic!("{}\nCan't open zip archive {}", err, input)));
+            let mut read = archive.by_index(0).unwrap_or_else(|err| panic!("{}\nCan't open zipped file {}", err, input)); 
             do_read(
-                &mut archive.by_index(0).unwrap_or_else(|err| panic!("{}\nCan't open zipped file {}", err, input)),
-                matches.value_of("json"),
-                matches.value_of("sqlite"),
-                matches.value_of("chunksize"),
-                matches.value_of("mongodb"),
-                matches.value_of("db").unwrap_or("test"),
-                matches.value_of("collection").unwrap_or("ess")
+                &mut read,
+                args.json,
+                args.sqlite,
+                args.chunksize
             )
         }
         _ => panic!("Unsupported format: {}", format)
